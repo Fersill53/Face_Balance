@@ -1,35 +1,20 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+// src/App.tsx
+import React from "react";
+import FaceCanvas from "./components/FaceCanvas";
 
 function App() {
-  const [count, setCount] = useState(0)
-
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
+    <div style={{ fontFamily: "Inter, system-ui, sans-serif", padding: 20 }}>
+      <h1>Face Balance — Face Mapping Prototype</h1>
+      <p>
+        Upload a front-facing photo. The app will detect facial landmarks and let you add draggable injection points.
       </p>
-    </>
-  )
+      <FaceCanvas />
+      <footer style={{ marginTop: 20, fontSize: 13, color: "#666" }}>
+        Prototype — images are processed locally in your browser.
+      </footer>
+    </div>
+  );
 }
 
-export default App
+export default App;
