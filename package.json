@@ -10,8 +10,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tensorflow-models/face-landmarks-detection": "^1.0.6",
+    "@tensorflow/tfjs-backend-webgl": "^4.22.0",
+    "@tensorflow/tfjs-core": "^4.22.0",
+    "glob": "11.0.3",
+    "konva": "^10.0.8",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "react-konva": "^19.2.0",
+    "rimraf": "4.4.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.36.0",
