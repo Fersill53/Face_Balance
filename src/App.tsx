@@ -1,6 +1,6 @@
 // src/App.tsx
 import React from "react";
-import FaceCanvas from "./components/FaceCanvas";
+import FaceCanvas from "./components/FaceCanvas.tsx";
 
 function App() {
   return (
