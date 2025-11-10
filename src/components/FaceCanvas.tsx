@@ -389,6 +389,7 @@ export default function FaceCanvas(): JSX.Element {
 }
   */
 
+/* WORKING VERSION!
 // src/components/FaceCanvas.tsx
 import React, { useEffect, useRef, useState } from "react";
 import {
@@ -674,7 +675,7 @@ export default function FaceCanvas(): JSX.Element {
         <div style={{ border: "1px solid #eee", padding: 6 }}>
           <Stage width={stageSize.width} height={stageSize.height} ref={stageRef}>
             <Layer>
-              {/* cast to any for Konva image prop to avoid strict signature mismatch */}
+              {/* cast to any for Konva image prop to avoid strict signature mismatch }
               {imgEl ? (
                 // @ts-ignore: Konva's Image prop expects many possible types; runtime OK
                 <KonvaImageElement image={imgEl as any} x={0} y={0} width={stageSize.width} height={stageSize.height} />
@@ -759,3 +760,1059 @@ export default function FaceCanvas(): JSX.Element {
   );
 }
 
+*/
+
+/* works but lines and points are not calibrated
+// src/components/FaceCanvas.tsx
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Stage,
+  Layer,
+  Image as KonvaImageElement,
+  Circle,
+  Line,
+  Text,
+  Group,
+} from "react-konva";
+import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
+import * as tf from "@tensorflow/tfjs-core";
+import "@tensorflow/tfjs-backend-webgl";
+import { nanoid } from "nanoid";
+
+type Landmark = [number, number, number?];
+
+const DEFAULT_STAGE_WIDTH = 800;
+const DEFAULT_STAGE_HEIGHT = 800;
+
+function fitImage(imageWidth: number, imageHeight: number, stageW: number, stageH: number) {
+  const imgRatio = imageWidth / imageHeight;
+  const stageRatio = stageW / stageH;
+  let width = stageW;
+  let height = stageH;
+  if (imgRatio > stageRatio) {
+    width = stageW;
+    height = Math.round(stageW / imgRatio);
+  } else {
+    height = stageH;
+    width = Math.round(stageH * imgRatio);
+  }
+  return { width, height };
+}
+
+// vector helpers
+function vecSub(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return { x: a.x - b.x, y: a.y - b.y };
+}
+function vecDot(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return a.x * b.x + a.y * b.y;
+}
+function vecLen(a: { x: number; y: number }) {
+  return Math.hypot(a.x, a.y);
+}
+function vecScale(a: { x: number; y: number }, s: number) {
+  return { x: a.x * s, y: a.y * s };
+}
+function vecAdd(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return { x: a.x + b.x, y: a.y + b.y };
+}
+function perpDistanceToLine(point: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) {
+  // returns {dist, side} where side >0 or <0 indicates which side (by cross)
+  const v = vecSub(b, a);
+  const w = vecSub(point, a);
+  const vlen2 = v.x * v.x + v.y * v.y;
+  if (vlen2 === 0) return { dist: vecLen(w), side: 0 };
+  // projection scalar
+  const t = vecDot(w, v) / vlen2;
+  // projection point
+  const proj = vecAdd(a, vecScale(v, t));
+  const perp = vecSub(point, proj);
+  const dist = vecLen(perp);
+  // cross product z (v x w)
+  const cross = v.x * w.y - v.y * w.x;
+  const side = cross; // sign indicates side
+  return { dist, side };
+}
+// @ts-ignore
+export default function FaceCanvas(): JSX.Element {
+  const [file, setFile] = useState<File | null>(null);
+  const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [imgEl, setImgEl] = useState<HTMLImageElement | null>(null);
+  const stageRef = useRef<any>(null);
+
+  const [landmarks, setLandmarks] = useState<Landmark[]>([]);
+  const [detector, setDetector] = useState<any | null>(null);
+  const [points, setPoints] = useState<{ id: string; x: number; y: number }[]>([]);
+  const [stageSize, setStageSize] = useState({ width: DEFAULT_STAGE_WIDTH, height: DEFAULT_STAGE_HEIGHT });
+
+  // toggles for reference lines
+  const [showMidline, setShowMidline] = useState(true);
+  const [showEyeLine, setShowEyeLine] = useState(true);
+  const [showThirds, setShowThirds] = useState(true);
+
+  // convert selected file to data URL
+  useEffect(() => {
+    if (!file) {
+      setImageSrc(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setImageSrc(String(reader.result));
+    reader.onerror = (e) => {
+      console.error("FileReader error", e);
+      setImageSrc(null);
+    };
+    reader.readAsDataURL(file);
+  }, [file]);
+
+  // data URL -> native Image element (crossOrigin)
+  useEffect(() => {
+    if (!imageSrc) {
+      setImgEl(null);
+      return;
+    }
+    let mounted = true;
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.src = imageSrc;
+    image.onload = () => {
+      if (!mounted) return;
+      setImgEl(image);
+    };
+    image.onerror = (err) => {
+      console.error("Image load error", err);
+      if (mounted) setImgEl(null);
+    };
+    return () => {
+      mounted = false;
+    };
+  }, [imageSrc]);
+
+  // create detector (modern API with fallback to legacy)
+  useEffect(() => {
+    let mounted = true;
+    let created: any = null;
+
+    async function setup() {
+      try {
+        await tf.setBackend("webgl");
+        await tf.ready();
+
+        const modelConst = (faceLandmarksDetection as any).SupportedModels?.MediaPipeFaceMesh ??
+                           (faceLandmarksDetection as any).MediaPipeFaceMesh;
+
+        const detectorConfigTfjs = { runtime: "tfjs", maxFaces: 1, refineLandmarks: true };
+
+        try {
+          created = await (faceLandmarksDetection as any).createDetector(modelConst, detectorConfigTfjs);
+          if (mounted) setDetector(created);
+          else if (created?.dispose) created.dispose();
+        } catch (errCreate) {
+          console.warn("createDetector failed; trying legacy load():", errCreate);
+          try {
+            created = await (faceLandmarksDetection as any).load(
+              (faceLandmarksDetection as any).SupportedPackages?.mediapipeFacemesh ??
+                (faceLandmarksDetection as any).SupportedPackages,
+              { maxFaces: 1 }
+            );
+            if (mounted) setDetector(created);
+          } catch (errLegacy) {
+            console.error("Both createDetector and legacy load() failed:", errLegacy);
+            throw errLegacy;
+          }
+        }
+      } catch (err) {
+        console.error("Detector setup error:", err);
+      }
+    }
+
+    setup();
+
+    return () => {
+      mounted = false;
+      if (created && typeof created.dispose === "function") {
+        try {
+          created.dispose();
+        } catch {}
+      }
+    };
+  }, []);
+
+  // update stage size to fit image
+  useEffect(() => {
+    if (!imgEl) {
+      setStageSize({ width: 800, height: 600 });
+      return;
+    }
+    const naturalW = imgEl.naturalWidth || DEFAULT_STAGE_WIDTH;
+    const naturalH = imgEl.naturalHeight || DEFAULT_STAGE_HEIGHT;
+    const fit = fitImage(naturalW, naturalH, DEFAULT_STAGE_WIDTH, DEFAULT_STAGE_HEIGHT);
+    setStageSize({ width: fit.width, height: fit.height });
+  }, [imgEl]);
+
+  // detection (re-uses robust attempt)
+  useEffect(() => {
+    if (!detector || !imgEl) return;
+    let cancelled = false;
+
+    async function detectOnce() {
+      try {
+        const naturalW = imgEl.naturalWidth || DEFAULT_STAGE_WIDTH;
+        const naturalH = imgEl.naturalHeight || DEFAULT_STAGE_HEIGHT;
+        const fit = fitImage(naturalW, naturalH, stageSize.width, stageSize.height);
+
+        const off = document.createElement("canvas");
+        off.width = fit.width;
+        off.height = fit.height;
+        const ctx = off.getContext("2d")!;
+        ctx.clearRect(0, 0, off.width, off.height);
+        ctx.drawImage(imgEl, 0, 0, fit.width, fit.height);
+
+        let predictions: any = null;
+        let lastErr: any = null;
+
+        try {
+          predictions = await (detector as any).estimateFaces(off);
+        } catch (e1) {
+          lastErr = e1;
+          try {
+            predictions = await (detector as any).estimateFaces({ input: off });
+          } catch (e2) {
+            lastErr = e2;
+            try {
+              predictions = await (detector as any).estimateFaces(off, { flipHorizontal: false });
+            } catch (e3) {
+              lastErr = e3;
+            }
+          }
+        }
+
+        if (!predictions) {
+          console.error("All estimateFaces attempts failed:", lastErr);
+          throw lastErr;
+        }
+
+        if (cancelled) return;
+
+        if (!predictions || predictions.length === 0) {
+          setLandmarks([]);
+          setPoints([]);
+          return;
+        }
+
+        const face = predictions[0] as any;
+        let mesh: Landmark[] = [];
+
+        if (Array.isArray(face?.scaledMesh)) mesh = face.scaledMesh as Landmark[];
+        else if (Array.isArray(face?.mesh)) mesh = face.mesh as Landmark[];
+        else if (Array.isArray(face?.keypoints)) mesh = (face.keypoints as any[]).map(kp => [kp.x, kp.y, kp.z ?? 0]);
+        else if (Array.isArray(face?.keypoints3D)) mesh = face.keypoints3D as Landmark[];
+        else console.warn("Unknown prediction shape", face);
+
+        setLandmarks(mesh || []);
+
+        // populate default points if none exist (don't overwrite existing points)
+        if ((!points || points.length === 0) && mesh && mesh.length > 0) {
+          const lipsIndices = [13, 14, 78, 308];
+          const defaultPoints = lipsIndices
+            .map((i) => {
+              const p = mesh && mesh[i];
+              if (!p) return null;
+              return { id: nanoid(), x: p[0], y: p[1] };
+            })
+            .filter(Boolean) as { id: string; x: number; y: number }[];
+          setPoints(defaultPoints);
+        }
+      } catch (err) {
+        console.error("detectOnce error:", err);
+      }
+    }
+
+    detectOnce();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detector, imgEl]);
+
+  function onAddPoint() {
+    setPoints((p) => [...p, { id: nanoid(), x: stageSize.width / 2, y: stageSize.height / 2 }]);
+  }
+
+  function onExport() {
+    if (!stageRef.current) return;
+    try {
+      // @ts-ignore (kept intentionally)
+      const uri = stageRef.current.toDataURL({ pixelRatio: 2 });
+      const link = document.createElement("a");
+      link.download = `face_map_${Date.now()}.png`;
+      link.href = uri;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      console.error("Export error:", err);
+      alert("Export failed (canvas may be tainted). Make sure image is loaded from same origin or crossOrigin='anonymous'.");
+    }
+  }
+
+  // compute reference line points (midline endpoints, eye points, thirds)
+  const midlineEndpoints =
+    landmarks.length > 152 && landmarks[10] && landmarks[152]
+      ? { a: { x: landmarks[10][0], y: landmarks[10][1] }, b: { x: landmarks[152][0], y: landmarks[152][1] } }
+      : // fallback: use minY and maxY of landmarks with center x
+        (() => {
+          if (!landmarks || landmarks.length === 0) return null;
+          let minY = Infinity,
+            maxY = -Infinity;
+          let minX = Infinity,
+            maxX = -Infinity;
+          for (const lm of landmarks) {
+            if (!lm) continue;
+            const x = lm[0],
+              y = lm[1];
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+          const cx = (minX + maxX) / 2;
+          return { a: { x: cx, y: minY }, b: { x: cx, y: maxY } };
+        })();
+
+  const eyeLine =
+    landmarks.length > 263 && landmarks[33] && landmarks[263]
+      ? { l: { x: landmarks[33][0], y: landmarks[33][1] }, r: { x: landmarks[263][0], y: landmarks[263][1] } }
+      : null;
+
+  const thirdsYs = (() => {
+    if (!landmarks || landmarks.length === 0) return null;
+    let minY = Infinity,
+      maxY = -Infinity;
+    let minX = Infinity,
+      maxX = -Infinity;
+    for (const lm of landmarks) {
+      if (!lm) continue;
+      const x = lm[0],
+        y = lm[1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const h = maxY - minY;
+    if (!isFinite(h) || h <= 0) return null;
+    const y1 = minY + h / 3;
+    const y2 = minY + (2 * h) / 3;
+    return { y1, y2, xmin: minX, xmax: maxX };
+  })();
+
+  // compute offsets for each annotation point relative to midline
+  const pointOffsets = points.map((pt) => {
+    if (!midlineEndpoints) return { id: pt.id, dist: 0, side: 0 };
+    const { a, b } = midlineEndpoints;
+    const { dist, side } = perpDistanceToLine({ x: pt.x, y: pt.y }, a, b);
+    // side sign normalization: positive => left or right depending on orientation; we'll just show L/R
+    return { id: pt.id, dist: Math.round(dist), side: side };
+  });
+
+  // helper to format side as L/R
+  function sideLabel(side: number) {
+    if (side === 0) return "C";
+    // sign positive/negative depends on orientation; decide convention: positive => left
+    return side > 0 ? "L" : "R";
+  }
+
+  return (
+    <div style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, maxWidth: 1100 }}>
+      <div style={{ marginBottom: 12, display: "flex", gap: 12, alignItems: "center" }}>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(e) => {
+            if (!e.target.files?.[0]) return;
+            setFile(e.target.files[0]);
+            // reset points/landmarks on new image
+            setPoints([]);
+            setLandmarks([]);
+          }}
+        />
+        <button onClick={onAddPoint}>Add point</button>
+        <button onClick={onExport}>Export PNG</button>
+
+        <div style={{ marginLeft: 16, display: "flex", gap: 8, alignItems: "center" }}>
+          <label>
+            <input type="checkbox" checked={showMidline} onChange={(e) => setShowMidline(e.target.checked)} /> Midline
+          </label>
+          <label>
+            <input type="checkbox" checked={showEyeLine} onChange={(e) => setShowEyeLine(e.target.checked)} /> Eye-line
+          </label>
+          <label>
+            <input type="checkbox" checked={showThirds} onChange={(e) => setShowThirds(e.target.checked)} /> Thirds
+          </label>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12 }}>
+        <div style={{ border: "1px solid #eee", padding: 6 }}>
+          <Stage width={stageSize.width} height={stageSize.height} ref={stageRef}>
+            <Layer>
+              {imgEl ? (
+                // @ts-ignore
+                <KonvaImageElement image={imgEl as any} x={0} y={0} width={stageSize.width} height={stageSize.height} />
+              ) : null}
+            </Layer>
+
+            <Layer>
+              {/* draw landmarks as tiny dots }
+              {landmarks.length > 0
+                ? landmarks.map((lm, idx) => {
+                    const x = lm[0];
+                    const y = lm[1];
+                    return <Circle key={`lm-${idx}`} x={x} y={y} radius={1.2} fill="rgba(0,150,255,0.9)" />;
+                  })
+                : null}
+
+              {/* reference: midline }
+              {showMidline && midlineEndpoints ? (
+                <>
+                  <Line
+                    points={[midlineEndpoints.a.x, midlineEndpoints.a.y, midlineEndpoints.b.x, midlineEndpoints.b.y]}
+                    stroke="rgba(255,0,0,0.85)"
+                    strokeWidth={1.5}
+                    dash={[6, 4]}
+                  />
+                  <Text
+                    text="Midline"
+                    x={(midlineEndpoints.a.x + midlineEndpoints.b.x) / 2 + 6}
+                    y={(midlineEndpoints.a.y + midlineEndpoints.b.y) / 2 + 6}
+                    fontSize={12}
+                    fill="rgba(255,0,0,0.9)"
+                  />
+                </>
+              ) : null}
+
+              {/* reference: eye-line }
+              {showEyeLine && eyeLine ? (
+                <>
+                  <Line
+                    points={[eyeLine.l.x, eyeLine.l.y, eyeLine.r.x, eyeLine.r.y]}
+                    stroke="rgba(0,200,0,0.9)"
+                    strokeWidth={1.5}
+                  />
+                  <Text
+                    text="Eye-line"
+                    x={(eyeLine.l.x + eyeLine.r.x) / 2 + 6}
+                    y={(eyeLine.l.y + eyeLine.r.y) / 2 - 16}
+                    fontSize={12}
+                    fill="rgba(0,160,0,0.9)"
+                  />
+                </>
+              ) : null}
+
+              {/* thirds }
+              {showThirds && thirdsYs ? (
+                <>
+                  <Line points={[thirdsYs.xmin, thirdsYs.y1, thirdsYs.xmax, thirdsYs.y1]} stroke="rgba(0,0,0,0.5)" strokeWidth={1} dash={[4, 4]} />
+                  <Text text="1/3" x={thirdsYs.xmax + 6} y={thirdsYs.y1 - 6} fontSize={11} fill="#333" />
+                  <Line points={[thirdsYs.xmin, thirdsYs.y2, thirdsYs.xmax, thirdsYs.y2]} stroke="rgba(0,0,0,0.5)" strokeWidth={1} dash={[4, 4]} />
+                  <Text text="2/3" x={thirdsYs.xmax + 6} y={thirdsYs.y2 - 6} fontSize={11} fill="#333" />
+                </>
+              ) : null}
+
+              {/* draggable annotation points + offset labels }
+              {points.map((p) => {
+                const offset = pointOffsets.find((o) => o.id === p.id);
+                const label = offset ? `${sideLabel(offset.side)} ${offset.dist}px` : "";
+                return (
+                  <Group
+                    key={p.id}
+                    x={p.x}
+                    y={p.y}
+                    draggable
+                    onDragEnd={(e) => {
+                      const nx = (e.target as any).x();
+                      const ny = (e.target as any).y();
+                      setPoints((prev) => prev.map((q) => (q.id === p.id ? { ...q, x: nx, y: ny } : q)));
+                    }}
+                  >
+                    <Circle radius={8} fill="rgba(255,165,0,0.95)" stroke="black" strokeWidth={1} />
+                    <Text text="●" fontSize={12} offsetX={6} offsetY={6} />
+                    <Text text={label} x={12} y={-10} fontSize={11} fill="#222" />
+                  </Group>
+                );
+              })}
+            </Layer>
+          </Stage>
+        </div>
+
+        <div style={{ width: 340 }}>
+          <h3>Session</h3>
+          <div>
+            <strong>Detected landmarks:</strong> {landmarks.length}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <h4>Reference Lines</h4>
+            <div>Midline: {midlineEndpoints ? `from (${Math.round(midlineEndpoints.a.x)},${Math.round(midlineEndpoints.a.y)}) to (${Math.round(midlineEndpoints.b.x)},${Math.round(midlineEndpoints.b.y)})` : "n/a"}</div>
+            <div>Eye-line: {eyeLine ? `L(${Math.round(eyeLine.l.x)},${Math.round(eyeLine.l.y)}) R(${Math.round(eyeLine.r.x)},${Math.round(eyeLine.r.y)})` : "n/a"}</div>
+            <div>Thirds: {thirdsYs ? `y1=${Math.round(thirdsYs.y1)} y2=${Math.round(thirdsYs.y2)}` : "n/a"}</div>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <h4>Injection points</h4>
+            {points.length === 0 ? <div>No points yet</div> : null}
+            {points.map((p) => {
+              const off = pointOffsets.find((o) => o.id === p.id);
+              return (
+                <div key={p.id} style={{ marginBottom: 8 }}>
+                  <small>ID: {p.id}</small>
+                  <div>
+                    x: {Math.round(p.x)}, y: {Math.round(p.y)}{" "}
+                    <button onClick={() => setPoints((ps) => ps.filter((q) => q.id !== p.id))} style={{ marginLeft: 6 }}>
+                      remove
+                    </button>
+                  </div>
+                  <div style={{ color: "#444", marginTop: 4 }}>
+                    Offset to midline: {off ? `${sideLabel(off.side)} ${off.dist}px` : "—"}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <small style={{ color: "#666" }}>
+              Tip: Toggle Midline / Eye-line / Thirds to help align injection points. Distances are in pixels.
+            </small>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+*/
+
+// src/components/FaceCanvas.tsx
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Stage,
+  Layer,
+  Image as KonvaImageElement,
+  Circle,
+  Line,
+  Text,
+  Group,
+} from "react-konva";
+import * as faceLandmarksDetection from "@tensorflow-models/face-landmarks-detection";
+import * as tf from "@tensorflow/tfjs-core";
+import "@tensorflow/tfjs-backend-webgl";
+import { nanoid } from "nanoid";
+
+type Landmark = [number, number, number?];
+
+const DEFAULT_STAGE_WIDTH = 800;
+const DEFAULT_STAGE_HEIGHT = 800;
+
+function fitImage(imageWidth: number, imageHeight: number, stageW: number, stageH: number) {
+  const imgRatio = imageWidth / imageHeight;
+  const stageRatio = stageW / stageH;
+  let width = stageW;
+  let height = stageH;
+  if (imgRatio > stageRatio) {
+    width = stageW;
+    height = Math.round(stageW / imgRatio);
+  } else {
+    height = stageH;
+    width = Math.round(stageH * imgRatio);
+  }
+  return { width, height };
+}
+
+// vector helpers (unchanged)
+function vecSub(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return { x: a.x - b.x, y: a.y - b.y };
+}
+function vecDot(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return a.x * b.x + a.y * b.y;
+}
+function vecLen(a: { x: number; y: number }) {
+  return Math.hypot(a.x, a.y);
+}
+function vecScale(a: { x: number; y: number }, s: number) {
+  return { x: a.x * s, y: a.y * s };
+}
+function vecAdd(a: { x: number; y: number }, b: { x: number; y: number }) {
+  return { x: a.x + b.x, y: a.y + b.y };
+}
+function perpDistanceToLine(point: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) {
+  const v = vecSub(b, a);
+  const w = vecSub(point, a);
+  const vlen2 = v.x * v.x + v.y * v.y;
+  if (vlen2 === 0) return { dist: vecLen(w), side: 0 };
+  const t = vecDot(w, v) / vlen2;
+  const proj = vecAdd(a, vecScale(v, t));
+  const perp = vecSub(point, proj);
+  const dist = vecLen(perp);
+  const cross = v.x * w.y - v.y * w.x;
+  const side = cross;
+  return { dist, side };
+}
+// @ts-ignore
+export default function FaceCanvas(): JSX.Element {
+  const [file, setFile] = useState<File | null>(null);
+  const [imageSrc, setImageSrc] = useState<string | null>(null);
+  const [imgEl, setImgEl] = useState<HTMLImageElement | null>(null);
+  const stageRef = useRef<any>(null);
+
+  const [imageFit, setImageFit] = useState<{ width: number; height: number } | null>(null); // NEW: store fit used for both stage & detection
+  const [landmarks, setLandmarks] = useState<Landmark[]>([]);
+  const [detector, setDetector] = useState<any | null>(null);
+  const [points, setPoints] = useState<{ id: string; x: number; y: number }[]>([]);
+  const [stageSize, setStageSize] = useState({ width: DEFAULT_STAGE_WIDTH, height: DEFAULT_STAGE_HEIGHT });
+
+  // toggles
+  const [showMidline, setShowMidline] = useState(true);
+  const [showEyeLine, setShowEyeLine] = useState(true);
+  const [showThirds, setShowThirds] = useState(true);
+
+  // file -> data URL
+  useEffect(() => {
+    if (!file) {
+      setImageSrc(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setImageSrc(String(reader.result));
+    reader.onerror = (e) => {
+      console.error("FileReader error", e);
+      setImageSrc(null);
+    };
+    reader.readAsDataURL(file);
+  }, [file]);
+
+  // data URL -> HTMLImageElement (crossOrigin)
+  useEffect(() => {
+    if (!imageSrc) {
+      setImgEl(null);
+      setImageFit(null);
+      setStageSize({ width: DEFAULT_STAGE_WIDTH, height: DEFAULT_STAGE_HEIGHT });
+      return;
+    }
+    let mounted = true;
+    const image = new Image();
+    image.crossOrigin = "anonymous";
+    image.src = imageSrc;
+    image.onload = () => {
+      if (!mounted) return;
+      setImgEl(image);
+
+      // compute fit based on natural size and DEFAULT stage bounds (this single fit is used everywhere)
+      const naturalW = image.naturalWidth || DEFAULT_STAGE_WIDTH;
+      const naturalH = image.naturalHeight || DEFAULT_STAGE_HEIGHT;
+      const fit = fitImage(naturalW, naturalH, DEFAULT_STAGE_WIDTH, DEFAULT_STAGE_HEIGHT);
+
+      // set both imageFit and stageSize from same fit
+      setImageFit(fit);
+      setStageSize({ width: fit.width, height: fit.height });
+    };
+    image.onerror = (err) => {
+      console.error("Image load error", err);
+      if (mounted) {
+        setImgEl(null);
+        setImageFit(null);
+      }
+    };
+    return () => {
+      mounted = false;
+    };
+  }, [imageSrc]);
+
+  // detector creation (unchanged logic)
+  useEffect(() => {
+    let mounted = true;
+    let created: any = null;
+
+    async function setup() {
+      try {
+        await tf.setBackend("webgl");
+        await tf.ready();
+
+        const modelConst = (faceLandmarksDetection as any).SupportedModels?.MediaPipeFaceMesh ??
+                           (faceLandmarksDetection as any).MediaPipeFaceMesh;
+
+        const detectorConfigTfjs = { runtime: "tfjs", maxFaces: 1, refineLandmarks: true };
+
+        try {
+          created = await (faceLandmarksDetection as any).createDetector(modelConst, detectorConfigTfjs);
+          if (mounted) setDetector(created);
+          else if (created?.dispose) created.dispose();
+        } catch (errCreate) {
+          console.warn("createDetector failed; trying legacy load():", errCreate);
+          try {
+            created = await (faceLandmarksDetection as any).load(
+              (faceLandmarksDetection as any).SupportedPackages?.mediapipeFacemesh ??
+                (faceLandmarksDetection as any).SupportedPackages,
+              { maxFaces: 1 }
+            );
+            if (mounted) setDetector(created);
+          } catch (errLegacy) {
+            console.error("Both createDetector and legacy load() failed:", errLegacy);
+            throw errLegacy;
+          }
+        }
+      } catch (err) {
+        console.error("Detector setup error:", err);
+      }
+    }
+
+    setup();
+
+    return () => {
+      mounted = false;
+      if (created && typeof created.dispose === "function") {
+        try {
+          created.dispose();
+        } catch {}
+      }
+    };
+  }, []);
+
+  // DETECTION: run only when detector AND imageFit are ready
+  useEffect(() => {
+    if (!detector || !imgEl || !imageFit) return;
+    let cancelled = false;
+
+    async function detectOnce() {
+      try {
+        // Use imageFit for canvas size (guarantees same coordinates as stage)
+        const off = document.createElement("canvas");
+        off.width = imageFit.width;
+        off.height = imageFit.height;
+        const ctx = off.getContext("2d")!;
+        ctx.clearRect(0, 0, off.width, off.height);
+        // draw image scaled to the same fit used by stage
+        ctx.drawImage(imgEl, 0, 0, imageFit.width, imageFit.height);
+
+        let predictions: any = null;
+        let lastErr: any = null;
+
+        try {
+          predictions = await (detector as any).estimateFaces(off);
+        } catch (e1) {
+          lastErr = e1;
+          try {
+            predictions = await (detector as any).estimateFaces({ input: off });
+          } catch (e2) {
+            lastErr = e2;
+            try {
+              predictions = await (detector as any).estimateFaces(off, { flipHorizontal: false });
+            } catch (e3) {
+              lastErr = e3;
+            }
+          }
+        }
+
+        if (!predictions) {
+          console.error("All estimateFaces attempts failed:", lastErr);
+          throw lastErr;
+        }
+
+        if (cancelled) return;
+
+        if (!predictions || predictions.length === 0) {
+          setLandmarks([]);
+          // do not override user-added points
+          return;
+        }
+
+        const face = predictions[0] as any;
+        let mesh: Landmark[] = [];
+
+        if (Array.isArray(face?.scaledMesh)) mesh = face.scaledMesh as Landmark[];
+        else if (Array.isArray(face?.mesh)) mesh = face.mesh as Landmark[];
+        else if (Array.isArray(face?.keypoints)) mesh = (face.keypoints as any[]).map(kp => [kp.x, kp.y, kp.z ?? 0]);
+        else if (Array.isArray(face?.keypoints3D)) mesh = face.keypoints3D as Landmark[];
+        else console.warn("Unknown prediction shape", face);
+
+        // IMPORTANT: mesh coordinates correspond to the off canvas size (imageFit.width/height)
+        // We store them directly and the Stage uses the same size (imageFit), so drawing lines/points will align.
+        setLandmarks(mesh || []);
+
+        // populate default points only when none exist (do not overwrite user points)
+        if ((!points || points.length === 0) && mesh && mesh.length > 0) {
+          const lipsIndices = [13, 14, 78, 308];
+          const defaultPoints = lipsIndices
+            .map((i) => {
+              const p = mesh && mesh[i];
+              if (!p) return null;
+              return { id: nanoid(), x: p[0], y: p[1] };
+            })
+            .filter(Boolean) as { id: string; x: number; y: number }[];
+          setPoints(defaultPoints);
+        }
+      } catch (err) {
+        console.error("detectOnce error:", err);
+      }
+    }
+
+    detectOnce();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [detector, imgEl, imageFit]); // run after imageFit is set
+
+  // keep stage size in sync with imageFit whenever imageFit changes
+  useEffect(() => {
+    if (imageFit) {
+      setStageSize({ width: imageFit.width, height: imageFit.height });
+    }
+  }, [imageFit]);
+
+  function onAddPoint() {
+    setPoints((p) => [...p, { id: nanoid(), x: (imageFit?.width ?? stageSize.width) / 2, y: (imageFit?.height ?? stageSize.height) / 2 }]);
+  }
+
+  function onExport() {
+    if (!stageRef.current) return;
+    try {
+      // @ts-ignore (kept intentionally)
+      const uri = stageRef.current.toDataURL({ pixelRatio: 2 });
+      const link = document.createElement("a");
+      link.download = `face_map_${Date.now()}.png`;
+      link.href = uri;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      console.error("Export error:", err);
+      alert("Export failed (canvas may be tainted). Make sure image is loaded from same origin or crossOrigin='anonymous'.");
+    }
+  }
+
+  // compute midline / eye-line / thirds (same logic as before)
+  const midlineEndpoints =
+    landmarks.length > 152 && landmarks[10] && landmarks[152]
+      ? { a: { x: landmarks[10][0], y: landmarks[10][1] }, b: { x: landmarks[152][0], y: landmarks[152][1] } }
+      : (() => {
+          if (!landmarks || landmarks.length === 0) return null;
+          let minY = Infinity,
+            maxY = -Infinity;
+          let minX = Infinity,
+            maxX = -Infinity;
+          for (const lm of landmarks) {
+            if (!lm) continue;
+            const x = lm[0],
+              y = lm[1];
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+          const cx = (minX + maxX) / 2;
+          return { a: { x: cx, y: minY }, b: { x: cx, y: maxY } };
+        })();
+
+  const eyeLine =
+    landmarks.length > 263 && landmarks[33] && landmarks[263]
+      ? { l: { x: landmarks[33][0], y: landmarks[33][1] }, r: { x: landmarks[263][0], y: landmarks[263][1] } }
+      : null;
+
+  const thirdsYs = (() => {
+    if (!landmarks || landmarks.length === 0) return null;
+    let minY = Infinity,
+      maxY = -Infinity;
+    let minX = Infinity,
+      maxX = -Infinity;
+    for (const lm of landmarks) {
+      if (!lm) continue;
+      const x = lm[0],
+        y = lm[1];
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const h = maxY - minY;
+    if (!isFinite(h) || h <= 0) return null;
+    const y1 = minY + h / 3;
+    const y2 = minY + (2 * h) / 3;
+    return { y1, y2, xmin: minX, xmax: maxX };
+  })();
+
+  const pointOffsets = points.map((pt) => {
+    if (!midlineEndpoints) return { id: pt.id, dist: 0, side: 0 };
+    const { a, b } = midlineEndpoints;
+    const { dist, side } = perpDistanceToLine({ x: pt.x, y: pt.y }, a, b);
+    return { id: pt.id, dist: Math.round(dist), side: side };
+  });
+
+  function sideLabel(side: number) {
+    if (side === 0) return "C";
+    return side > 0 ? "L" : "R";
+  }
+
+  return (
+    <div style={{ border: "1px solid #ddd", padding: 12, borderRadius: 8, maxWidth: 1100 }}>
+      <div style={{ marginBottom: 12, display: "flex", gap: 12, alignItems: "center" }}>
+        <input
+          type="file"
+          accept="image/*"
+          onChange={(e) => {
+            if (!e.target.files?.[0]) return;
+            setFile(e.target.files[0]);
+            setPoints([]);
+            setLandmarks([]);
+            setImageFit(null);
+          }}
+        />
+        <button onClick={onAddPoint}>Add point</button>
+        <button onClick={onExport}>Export PNG</button>
+
+        <div style={{ marginLeft: 16, display: "flex", gap: 8, alignItems: "center" }}>
+          <label>
+            <input type="checkbox" checked={showMidline} onChange={(e) => setShowMidline(e.target.checked)} /> Midline
+          </label>
+          <label>
+            <input type="checkbox" checked={showEyeLine} onChange={(e) => setShowEyeLine(e.target.checked)} /> Eye-line
+          </label>
+          <label>
+            <input type="checkbox" checked={showThirds} onChange={(e) => setShowThirds(e.target.checked)} /> Thirds
+          </label>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12 }}>
+        <div style={{ border: "1px solid #eee", padding: 6 }}>
+          <Stage width={stageSize.width} height={stageSize.height} ref={stageRef}>
+            <Layer>
+              {imgEl ? (
+                // @ts-ignore
+                <KonvaImageElement image={imgEl as any} x={0} y={0} width={stageSize.width} height={stageSize.height} />
+              ) : null}
+            </Layer>
+
+            <Layer>
+              {landmarks.length > 0
+                ? landmarks.map((lm, idx) => {
+                    const x = lm[0];
+                    const y = lm[1];
+                    return <Circle key={`lm-${idx}`} x={x} y={y} radius={1.2} fill="rgba(0,150,255,0.9)" />;
+                  })
+                : null}
+
+              {showMidline && midlineEndpoints ? (
+                <>
+                  <Line
+                    points={[midlineEndpoints.a.x, midlineEndpoints.a.y, midlineEndpoints.b.x, midlineEndpoints.b.y]}
+                    stroke="rgba(255,0,0,0.85)"
+                    strokeWidth={1.5}
+                    dash={[6, 4]}
+                  />
+                  <Text
+                    text="Midline"
+                    x={(midlineEndpoints.a.x + midlineEndpoints.b.x) / 2 + 6}
+                    y={(midlineEndpoints.a.y + midlineEndpoints.b.y) / 2 + 6}
+                    fontSize={12}
+                    fill="rgba(255,0,0,0.9)"
+                  />
+                </>
+              ) : null}
+
+              {showEyeLine && eyeLine ? (
+                <>
+                  <Line
+                    points={[eyeLine.l.x, eyeLine.l.y, eyeLine.r.x, eyeLine.r.y]}
+                    stroke="rgba(0,200,0,0.9)"
+                    strokeWidth={1.5}
+                  />
+                  <Text
+                    text="Eye-line"
+                    x={(eyeLine.l.x + eyeLine.r.x) / 2 + 6}
+                    y={(eyeLine.l.y + eyeLine.r.y) / 2 - 16}
+                    fontSize={12}
+                    fill="rgba(0,160,0,0.9)"
+                  />
+                </>
+              ) : null}
+
+              {showThirds && thirdsYs ? (
+                <>
+                  <Line points={[thirdsYs.xmin, thirdsYs.y1, thirdsYs.xmax, thirdsYs.y1]} stroke="rgba(0,0,0,0.5)" strokeWidth={1} dash={[4, 4]} />
+                  <Text text="1/3" x={thirdsYs.xmax + 6} y={thirdsYs.y1 - 6} fontSize={11} fill="#333" />
+                  <Line points={[thirdsYs.xmin, thirdsYs.y2, thirdsYs.xmax, thirdsYs.y2]} stroke="rgba(0,0,0,0.5)" strokeWidth={1} dash={[4, 4]} />
+                  <Text text="2/3" x={thirdsYs.xmax + 6} y={thirdsYs.y2 - 6} fontSize={11} fill="#333" />
+                </>
+              ) : null}
+
+              {points.map((p) => {
+                const offset = pointOffsets.find((o) => o.id === p.id);
+                const label = offset ? `${sideLabel(offset.side)} ${offset.dist}px` : "";
+                return (
+                  <Group
+                    key={p.id}
+                    x={p.x}
+                    y={p.y}
+                    draggable
+                    onDragEnd={(e) => {
+                      const nx = (e.target as any).x();
+                      const ny = (e.target as any).y();
+                      setPoints((prev) => prev.map((q) => (q.id === p.id ? { ...q, x: nx, y: ny } : q)));
+                    }}
+                  >
+                    <Circle radius={8} fill="rgba(255,165,0,0.95)" stroke="black" strokeWidth={1} />
+                    <Text text="●" fontSize={12} offsetX={6} offsetY={6} />
+                    <Text text={label} x={12} y={-10} fontSize={11} fill="#222" />
+                  </Group>
+                );
+              })}
+            </Layer>
+          </Stage>
+        </div>
+
+        <div style={{ width: 340 }}>
+          <h3>Session</h3>
+          <div>
+            <strong>Detected landmarks:</strong> {landmarks.length}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <h4>Reference Lines</h4>
+            <div>Midline: {midlineEndpoints ? `from (${Math.round(midlineEndpoints.a.x)},${Math.round(midlineEndpoints.a.y)}) to (${Math.round(midlineEndpoints.b.x)},${Math.round(midlineEndpoints.b.y)})` : "n/a"}</div>
+            <div>Eye-line: {eyeLine ? `L(${Math.round(eyeLine.l.x)},${Math.round(eyeLine.l.y)}) R(${Math.round(eyeLine.r.x)},${Math.round(eyeLine.r.y)})` : "n/a"}</div>
+            <div>Thirds: {thirdsYs ? `y1=${Math.round(thirdsYs.y1)} y2=${Math.round(thirdsYs.y2)}` : "n/a"}</div>
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <h4>Injection points</h4>
+            {points.length === 0 ? <div>No points yet</div> : null}
+            {points.map((p) => {
+              const off = pointOffsets.find((o) => o.id === p.id);
+              return (
+                <div key={p.id} style={{ marginBottom: 8 }}>
+                  <small>ID: {p.id}</small>
+                  <div>
+                    x: {Math.round(p.x)}, y: {Math.round(p.y)}{" "}
+                    <button onClick={() => setPoints((ps) => ps.filter((q) => q.id !== p.id))} style={{ marginLeft: 6 }}>
+                      remove
+                    </button>
+                  </div>
+                  <div style={{ color: "#444", marginTop: 4 }}>
+                    Offset to midline: {off ? `${sideLabel(off.side)} ${off.dist}px` : "—"}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
+            <small style={{ color: "#666" }}>
+              Tip: Toggle Midline / Eye-line / Thirds to help align injection points. Distances are in pixels.
+            </small>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
